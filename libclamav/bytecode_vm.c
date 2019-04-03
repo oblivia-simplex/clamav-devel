@@ -41,13 +41,13 @@
 #define CL_BYTECODE_SAFE
 
 #ifdef CL_BYTECODE_SAFE
-/* These checks will also be done by the bytecode verifier, but for
+/* These checks will also be done by the bytecode verifier, but for 
  * debugging purposes we have explicit checks, these should never fail! */
 #ifdef CL_DEBUG
 static int never_inline bcfail(const char *msg, long a, long b,
                                const char *file, unsigned line)
 {
-    cli_warnmsg("bytecode: check failed %s (%lx and %lx) at %s:%u\n", msg, a, b, file, line);
+    printf("[X] bytecode: check failed %s (%lx and %lx) at %s:%u\n", msg, a, b, file, line);
     return CL_EARG;
 }
 #else
@@ -79,18 +79,18 @@ static inline int bcfail(const char *msg, long a, long b,
 #define CHECK_EQ(a, b)
 #define CHECK_GT(a, b)
 #endif
-#if 0 /* too verbose, use #ifdef CL_DEBUG if needed */
+#if 1 /* too verbose, use #ifdef CL_DEBUG if needed */
 #define CHECK_UNREACHABLE                                \
     do {                                                 \
         cli_dbgmsg("bytecode: unreachable executed!\n"); \
         return CL_EBYTECODE;                             \
     } while (0)
-#define TRACE_PTR(ptr, s) cli_dbgmsg("bytecode trace: ptr %llx, +%x\n", ptr, s);
-#define TRACE_R(x) cli_dbgmsg("bytecode trace: %u, read %llx\n", pc, (long long)x);
-#define TRACE_W(x, w, p) cli_dbgmsg("bytecode trace: %u, write%d @%u %llx\n", pc, p, w, (long long)(x));
-#define TRACE_EXEC(id, dest, ty, stack) cli_dbgmsg("bytecode trace: executing %d, -> %u (%u); %u\n", id, dest, ty, stack)
-#define TRACE_INST(inst) do {unsigned bbnum = 0; printf("LibClamAV debug: bytecode trace: executing instruction "); cli_byteinst_describe(inst, &bbnum); printf("\n");} while (0)
-#define TRACE_API(s, dest, ty, stack) cli_dbgmsg("bytecode trace: executing %s, -> %u (%u); %u\n", s, dest, ty, stack)
+#define TRACE_PTR(ptr, s) printf("TRACE_PTR: ptr 0x%llx, +%x\n", ptr, s);
+#define TRACE_R(x) printf("TRACE_R: pc: 0x%x, read 0x%llx\n", pc, (long long)x);
+#define TRACE_W(x, w, p) printf("TRACE_W: pc: 0x%x, write%d @0x%x %llx\n", pc, p, w, (long long)(x));
+#define TRACE_EXEC(id, dest, ty, stack) printf("TRACE_EXEC: executing 0x%x, -> 0x%x (ty 0x%x); stack 0x%x\n", id, dest, ty, stack)
+#define TRACE_INST(inst) {unsigned bbnum = 0; cli_byteinst_describe(inst, &bbnum); printf("\n");} 
+#define TRACE_API(s, dest, ty, stack) printf("TRACE_API: executing %s, -> 0x%x (ty 0x%x); stack 0x%x\n", s, dest, ty, stack)
 #else
 #define CHECK_UNREACHABLE return CL_EBYTECODE
 #define TRACE_PTR(ptr, s)
@@ -340,6 +340,7 @@ static always_inline struct stack_entry *pop_stack(struct stack *stack,
         }                                              \
         TRACE_R(x)                                     \
     }
+/* NOTE: Fewer constraints than READP!! */
 #define READPOP(x, p, asize)                 \
     {                                        \
         if ((p)&0x40000000) {                \
@@ -616,24 +617,31 @@ static inline void *ptr_torealptr(const struct ptr_infos *infos, int64_t ptr,
         return NULL;
     }
     if (ptrid < 0) {
+        int32_t orig_ptrid = ptrid;
         ptrid = -ptrid - 1;
         if (UNLIKELY((const unsigned int)ptrid >= infos->nstacks)) {
             (void)bcfail("ptr", ptrid, infos->nstacks, __FILE__, __LINE__);
             return NULL;
         }
+        printf("[ptr_torealptr] ptrid %d: resolved to stack_infos[%d]\n", orig_ptrid, ptrid);
         info = &infos->stack_infos[ptrid];
     } else {
+        int32_t orig_ptrid = ptrid;
         ptrid--;
         if (UNLIKELY((const unsigned int)ptrid >= infos->nglobs)) {
             (void)bcfail("ptr", ptrid, infos->nglobs, __FILE__, __LINE__);
             return NULL;
         }
+        printf("[ptr_torealptr] ptrid %d: resolved to glob_infos[%d]\n", orig_ptrid, ptrid);
         info = &infos->glob_infos[ptrid];
     }
     if (LIKELY(ptroff < info->size &&
                read_size <= info->size &&
                ptroff + read_size <= info->size)) {
-        return info->base + ptroff;
+      void * pointer = info->base + ptroff;
+      printf("[ptr_torealptr] info->base = %p; ptroff = 0x%x. ptr = 0x%lx --> pointer = %p\n",
+             info->base, ptroff, ptr, pointer);
+      return pointer;
     }
 
     (void)bcfail("ptr1", ptroff, info->size, __FILE__, __LINE__);
@@ -728,6 +736,7 @@ int cli_vm_execute(const struct cli_bc *bc, struct cli_bc_ctx *ctx, const struct
             }
         }
 
+        printf("[%05x]\t", pc);
         TRACE_INST(inst);
 
         switch (inst->interp_op) {
@@ -1201,6 +1210,8 @@ int cli_vm_execute(const struct cli_bc *bc, struct cli_bc_ctx *ctx, const struct
                     READ64(arg3, inst->u.three[2]);
                     READPOP(arg1, inst->u.three[0], arg3);
                     READ32(arg2, inst->u.three[1]);
+                    goto op_memset_breakpoint;
+                op_memset_breakpoint:
                     memset(arg1, arg2, (int32_t)arg3);
                     break;
                 }

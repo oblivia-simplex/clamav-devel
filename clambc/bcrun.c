@@ -135,7 +135,7 @@ static void tracehook_ptr(struct cli_bc_ctx *ctx, const void *ptr)
     fprintf(stderr, "[trace] %p\n", ptr);
 }
 
-static uint8_t debug_flag = 0;
+static uint8_t debug_flag = 1;
 static void print_src(const char *file)
 {
     char buf[4096];

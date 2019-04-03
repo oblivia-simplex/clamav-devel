@@ -41,6 +41,9 @@
 #include "bytecode_api.h"
 #include "bytecode_api_impl.h"
 #include "builtin_bytecodes.h"
+
+#include "bytecode_pp.c" // let's not fuck with makefiles today
+
 #if HAVE_JSON
 #include "json.h"
 #endif
@@ -374,10 +377,11 @@ static inline uint64_t readNumber(const unsigned char *p, unsigned *off, unsigne
 {
     uint64_t n = 0;
     unsigned i, newoff, lim, p0 = p[*off], shift = 0;
-
+    unsigned init_off = *off;
     lim = p0 - 0x60;
     if (lim > 0x10) {
-        cli_errmsg("Invalid number type: %c\n", p0);
+      //cli_errmsg("Invalid number type: %c\n", p0);
+      printf("Invalid number type: 0x%02x of '%s'\n", p0, p+*off);
         *ok = 0;
         return 0;
     }
@@ -405,6 +409,11 @@ static inline uint64_t readNumber(const unsigned char *p, unsigned *off, unsigne
         n |= v;
         shift += 4;
     }
+    char *enc;
+    enc = calloc(sizeof(char), (newoff - init_off)+1);
+    strncpy(enc, p+init_off, (newoff - init_off));
+    printf("[readNumber] parsed '%s' --> 0x%lx at offset %d\n", enc, n, init_off);
+    free(enc);
     *off = newoff;
     return n;
 }
@@ -437,6 +446,7 @@ static inline unsigned readFixedNumber(const unsigned char *p, unsigned *off,
                                        unsigned len, char *ok, unsigned width)
 {
     unsigned i, n = 0, shift = 0;
+    unsigned init_off = *off;
     unsigned newoff = *off + width;
     if (newoff > len) {
         cli_errmsg("Newline encountered while reading number\n");
@@ -455,6 +465,12 @@ static inline unsigned readFixedNumber(const unsigned char *p, unsigned *off,
         n |= v;
         shift += 4;
     }
+    char *enc;
+    enc = calloc(sizeof(char), (newoff - init_off)+1);
+    strncpy(enc, p+init_off, (newoff - init_off));
+    printf("[readFixedNumber] parsed '%s' --> 0x%lx at offset %d\n", enc, n, init_off);
+    free(enc);
+
     *off = newoff;
     return n;
 }
@@ -463,6 +479,7 @@ static inline operand_t readOperand(struct cli_bc_func *func, unsigned char *p,
                                     unsigned *off, unsigned len, char *ok)
 {
     uint64_t v;
+    printf("[readOperand] p+*off = '%s'\n", p+*off);
     if ((p[*off] & 0xf0) == 0x40 || p[*off] == 0x50) {
         uint64_t *dest;
         uint16_t ty;
@@ -470,16 +487,18 @@ static inline operand_t readOperand(struct cli_bc_func *func, unsigned char *p,
         /* TODO: unique constants */
         func->constants = cli_realloc2(func->constants, (func->numConstants + 1) * sizeof(*func->constants));
         if (!func->constants) {
+          printf("[readOperand] func->constants = NULL, not ok.\n");
             *ok = 0;
             return MAX_OP;
         }
         v    = readNumber(p, off, len, ok);
         dest = &func->constants[func->numConstants];
         /* Write the constant to the correct place according to its type.
-	 * This is needed on big-endian machines, because constants are always
-	 * read as u64, but accessed as one of these types: u8, u16, u32, u64 */
+         * This is needed on big-endian machines, because constants are always
+         * read as u64, but accessed as one of these types: u8, u16, u32, u64 */
         *dest = 0;
         ty    = 8 * readFixedNumber(p, off, len, ok, 1);
+        printf("[readOperand] type is 0x%02x (read '%c')\n", ty, p[*off-1]);
         if (!ty) {
             /* This is a global variable */
             return 0x80000000 | v;
@@ -509,6 +528,7 @@ static inline char *readData(const unsigned char *p, unsigned *off, unsigned len
 {
     unsigned char *dat, *q;
     unsigned l, newoff, i;
+    unsigned int init_off = *off;
     if (p[*off] != '|') {
         cli_errmsg("Data start marker missing: %c\n", p[*off]);
         *ok = 0;
@@ -544,9 +564,16 @@ static inline char *readData(const unsigned char *p, unsigned *off, unsigned len
         }
         *q++ = (v0 & 0xf) | ((v1 & 0xf) << 4);
     }
-    *off     = newoff;
+    char * encoded;
+    encoded = calloc(sizeof(char), (newoff - init_off) + 1);
+    strncpy(encoded, p + init_off, (newoff - init_off));
+    char * ret = (char *) dat;
+    char * printable = printable_str(ret, l);
+    printf("PARSED DATA '%s' at offset %d:\n%s\n", encoded, init_off, printable);
+    free(printable);
     *datalen = l;
-    return (char *)dat;
+    *off     = newoff;
+    return ret;
 }
 
 static inline char *readString(const unsigned char *p, unsigned *off, unsigned len, char *ok)
@@ -571,13 +598,16 @@ static int parseHeader(struct cli_bc *bc, unsigned char *buffer, unsigned *linel
     unsigned offset, len, flevel;
     char *pos;
 
-    if (strncmp((const char *)buffer, BC_HEADER, sizeof(BC_HEADER) - 1)) {
+    printf("[parseHeader] to parse: %s\n", buffer);
+
+    if (strncmp((const char *)buffer, BC_HEADER, sizeof(BC_HEADER) - 1)) { /* BC_HEADER = ClamBC */
         cli_errmsg("Missing file magic in bytecode");
         return CL_EMALFDB;
     }
     offset                   = sizeof(BC_HEADER) - 1;
     len                      = strlen((const char *)buffer);
     bc->metadata.formatlevel = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->metadata.formatlevel = %d\n", bc->metadata.formatlevel);
     if (!ok) {
         cli_errmsg("Unable to parse (format) functionality level in bytecode header\n");
         return CL_EMALFDB;
@@ -585,17 +615,23 @@ static int parseHeader(struct cli_bc *bc, unsigned char *buffer, unsigned *linel
     /* we support 2 bytecode formats */
     if (bc->metadata.formatlevel != BC_FORMAT_096 &&
         bc->metadata.formatlevel != BC_FORMAT_LEVEL) {
-        cli_dbgmsg("Skipping bytecode with (format) functionality level: %u (current %u)\n",
-                   bc->metadata.formatlevel, BC_FORMAT_LEVEL);
+        printf("Skipping bytecode with (format) functionality level: %u (current %u)\n",
+               bc->metadata.formatlevel, BC_FORMAT_LEVEL);
         return CL_BREAK;
     }
     /* Optimistic parsing, check for error only at the end.*/
     bc->metadata.timestamp     = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->metadata.timestamp = %d\n", bc->metadata.timestamp);
     bc->metadata.sigmaker      = readString(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->metadata.sigmaker = %s\n", bc->metadata.sigmaker);
     bc->metadata.targetExclude = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->metadata.targetExclude = %d\n", bc->metadata.targetExclude);
     bc->kind                   = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->kind = %d\n", bc->kind);
     bc->metadata.minfunc       = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->metadata.minfunc = %d\n", bc->metadata.minfunc);
     bc->metadata.maxfunc       = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->metadata.maxfunc = %d\n", bc->metadata.maxfunc);
     flevel                     = cl_retflevel();
     /* in 0.96 these 2 fields are unused / zero, in post 0.96 these mean
      * min/max flevel.
@@ -610,9 +646,13 @@ static int parseHeader(struct cli_bc *bc, unsigned char *buffer, unsigned *linel
         return CL_BREAK;
     }
     bc->metadata.maxresource = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->metadata.maxresource = %d\n", bc->metadata.maxresource);
     bc->metadata.compiler    = readString(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->metadata.compiler = %s\n", bc->metadata.compiler);
     bc->num_types            = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->num_types = %d\n", bc->num_types);
     bc->num_func             = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] bc->num_func = %d\n", bc->num_func);
     bc->state                = bc_loaded;
     bc->uses_apis            = NULL;
     bc->dbgnodes             = NULL;
@@ -621,7 +661,9 @@ static int parseHeader(struct cli_bc *bc, unsigned char *buffer, unsigned *linel
         cli_errmsg("Invalid bytecode header at %u\n", offset);
         return CL_EMALFDB;
     }
+    printf("[parseHeader] about to parse magic1 from '%s'\n", buffer+offset);
     magic1 = readNumber(buffer, &offset, len, &ok);
+    printf("[parseHeader] about to parse magic2 from '%s'\n", buffer+offset);
     magic2 = readFixedNumber(buffer, &offset, len, &ok, 2);
     if (!ok || magic1 != 0x53e5493e9f3d1c30ull || magic2 != 42) {
         unsigned long m0 = magic1 >> 32;
@@ -675,13 +717,17 @@ static uint16_t readTypeID(struct cli_bc *bc, unsigned char *buffer,
                            unsigned *offset, unsigned len, char *ok)
 {
     uint64_t t = readNumber(buffer, offset, len, ok);
-    if (!ok)
+    if (!ok) {
+      printf("[readTypeID)] readNumber was not ok. returning 0x%hx.\n", ~0);
         return ~0;
+    }
     if (t >= bc->num_types + bc->start_tid) {
         cli_errmsg("Invalid type id: %llu\n", (unsigned long long)t);
         *ok = 0;
+        printf("[readTypeID] t = %d is too great. returning 0x%hx.\n", ~0);
         return ~0;
     }
+    printf("[readTypeID] returning %d, normally\n", t);
     return t;
 }
 
@@ -703,7 +749,10 @@ static void parseType(struct cli_bc *bc, struct cli_bc_type *ty,
         *ok = 0;
         return;
     }
+    printf("[parseType] ty->numElements = %d\n", ty->numElements);
     for (j = 0; j < ty->numElements; j++) {
+      printf("[parseType] reading into ty->containedTypes[%d] (addr %p) from offset %d\n",
+             j, ty->containedTypes+j, *off);
         ty->containedTypes[j] = readTypeID(bc, buffer, off, len, ok);
     }
 }
@@ -740,7 +789,9 @@ static int parseTypes(struct cli_bc *bc, unsigned char *buffer)
     add_static_types(bc);
     for (i = (BC_START_TID - 65); i < bc->num_types - 1; i++) {
         struct cli_bc_type *ty = &bc->types[i];
+        unsigned int _off = offset;
         uint8_t t              = readFixedNumber(buffer, &offset, len, &ok, 1);
+        printf("[parseTypes] from '%s' -> t = %d\n", buffer+_off, t);
         if (!ok) {
             cli_errmsg("Error reading type kind\n");
             return CL_EMALFDB;
@@ -824,6 +875,7 @@ static int types_equal(const struct cli_bc *bc, uint16_t *apity2ty, uint16_t tid
     unsigned i;
     const struct cli_bc_type *ty    = &bc->types[tid - 65];
     const struct cli_bc_type *apity = &cli_apicall_types[apitid];
+    printf("[types_equal] apity2ty = %d; tid = %d; apitid = %d\n", *apity2ty, tid, apitid);
     /* If we've already verified type equality, return.
      * Since we need to check equality of recursive types, we assume types are
      * equal while checking equality of contained types, unless proven
@@ -960,27 +1012,34 @@ static void readConstant(struct cli_bc *bc, unsigned i, unsigned comp,
                          unsigned len, char *ok)
 {
     unsigned j = 0;
+    printf("[readConstant] buffer[%d:%d] = '%c%c' (%02x%02x)\n", *offset, *offset+1,
+           buffer[*offset], buffer[*offset+1], buffer[*offset], buffer[*offset+1]);
     if (*ok && buffer[*offset] == 0x40 &&
         buffer[*offset + 1] == 0x60) {
+      printf("[readConstant] read \x40\x60. incrementing offset %d -> %d, init to zero\n", *offset, *offset+2);
         /* zero initializer */
         memset(bc->globals[i], 0, sizeof(*bc->globals[0]) * comp);
         (*offset) += 2;
         return;
     }
     while (*ok && buffer[*offset] != 0x60) {
+      printf("[readConstant] buffer[%d] = '%c' (%02x)\n", *offset, buffer[*offset], buffer[*offset]);
         if (j >= comp) {
-            cli_errmsg("bytecode: constant has too many subcomponents, expected %u\n", comp);
+          cli_errmsg("bytecode: constant has too many subcomponents: j == %u, expected < %u\n", j, comp);
             *ok = 0;
             return;
         }
         buffer[*offset] |= 0x20;
         bc->globals[i][j++] = readNumber(buffer, offset, len, ok);
+        printf("[readConstant] writing 0x%x to bc->globals[%d][%d] (%p) comp = %d\n",
+               bc->globals[i][j-1], i, j-1, bc->globals[i] + (j-1), comp);
     }
     if (*ok && j != comp) {
         cli_errmsg("bytecode: constant has too few subcomponents: %u < %u\n", j, comp);
         *ok = 0;
     }
     (*offset)++;
+    printf("[readConstant] exiting with offset %d\n", *offset);
 }
 
 /* parse constant globals with constant initializers */
@@ -1016,6 +1075,7 @@ static int parseGlobals(struct cli_bc *bc, unsigned char *buffer)
     for (i = 0; i < numglobals; i++) {
         unsigned comp;
         bc->globaltys[i] = readTypeID(bc, buffer, &offset, len, &ok);
+        printf("\n[parseGlobals] parsing global %d/%d : tid = %d\n", i+1, numglobals, bc->globaltys[i]);
         comp             = type_components(bc, bc->globaltys[i], &ok);
         if (!ok)
             return CL_EMALFDB;
@@ -1090,6 +1150,7 @@ static int parseFunctionHeader(struct cli_bc *bc, unsigned fn, unsigned char *bu
     char ok = 1;
     unsigned offset, len, all_locals = 0, i;
     struct cli_bc_func *func;
+    printf("[parseFunctionHeader] fn = %d; buffer = %s\n", fn, buffer);
 
     if (fn >= bc->num_func) {
         cli_errmsg("Found more functions than declared: %u >= %u\n", fn,
@@ -1104,13 +1165,16 @@ static int parseFunctionHeader(struct cli_bc *bc, unsigned fn, unsigned char *bu
         return CL_EMALFDB;
     }
     offset           = 1;
+    printf("[parseFunctionHeader] reading numArgs:\n");
     func->numArgs    = readFixedNumber(buffer, &offset, len, &ok, 1);
+    printf("[parseFunctionHeader] reading returnType:\n");
     func->returnType = readTypeID(bc, buffer, &offset, len, &ok);
     if (buffer[offset] != 'L') {
         cli_errmsg("Invalid function locals header: %c\n", buffer[offset]);
         return CL_EMALFDB;
     }
     offset++;
+    printf("[parseFunctionHeader] reading numLocals:\n");
     func->numLocals = readNumber(buffer, &offset, len, &ok);
     if (!ok) {
         cli_errmsg("Invalid number of arguments/locals\n");
@@ -1127,7 +1191,9 @@ static int parseFunctionHeader(struct cli_bc *bc, unsigned fn, unsigned char *bu
         }
     }
     for (i = 0; i < all_locals; i++) {
+      printf("[parseFunctionHeader] reading type of local %d:\n",i);
         func->types[i] = readNumber(buffer, &offset, len, &ok);
+        printf("[parseFunctionHeader] Checking for marker that would set type of %d |= 0x8000\n", i);
         if (readFixedNumber(buffer, &offset, len, &ok, 1))
             func->types[i] |= 0x8000;
     }
@@ -1140,6 +1206,7 @@ static int parseFunctionHeader(struct cli_bc *bc, unsigned fn, unsigned char *bu
         return CL_EMALFDB;
     }
     offset++;
+    printf("[parseFunctionHeader] reading numInsts\n");
     func->numInsts = readNumber(buffer, &offset, len, &ok);
     if (!ok) {
         cli_errmsg("Invalid instructions count\n");
@@ -1153,6 +1220,7 @@ static int parseFunctionHeader(struct cli_bc *bc, unsigned fn, unsigned char *bu
         cli_errmsg("Out of memory allocating instructions\n");
         return CL_EMEM;
     }
+    printf("[parseFunctionHeader] reading numBB\n");
     func->numBB = readNumber(buffer, &offset, len, &ok);
     if (!ok) {
         cli_errmsg("Invalid basic block count\n");
@@ -1170,7 +1238,7 @@ static bbid_t readBBID(struct cli_bc_func *func, const unsigned char *buffer, un
 {
     unsigned id = readNumber(buffer, off, len, ok);
     if (!id || id >= func->numBB) {
-        cli_errmsg("Basic block ID out of range: %u\n", id);
+      cli_errmsg("Basic block ID out of range: %u >= func->numBB = %u\n", id, func->numBB);
         *ok = 0;
     }
     if (!*ok)
@@ -1191,9 +1259,9 @@ static int16_t get_optype(const struct cli_bc_func *bcfunc, operand_t op)
         return 0;
     return bcfunc->types[op] & 0x7fff;
 }
-
 static int parseBB(struct cli_bc *bc, unsigned func, unsigned bb, unsigned char *buffer)
 {
+  printf("[parseBB] entering parseBB\n");
     char ok = 1;
     unsigned offset, len, i, last = 0;
     struct cli_bc_bb *BB;
@@ -1214,18 +1282,27 @@ static int parseBB(struct cli_bc *bc, unsigned func, unsigned bb, unsigned char 
     offset       = 1;
     BB->numInsts = 0;
     BB->insts    = &bcfunc->allinsts[bcfunc->insn_idx];
+    int inst_num = -1;
+    unsigned prev_off;
     while (!last) {
+      printf("[parseBB] entering main loop\n");
+        prev_off = offset;
+        inst_num++;
         unsigned numOp;
         if (buffer[offset] == 'T') {
+          printf("[parseBB] read terminator 'T', setting last = 1\n");
             last = 1;
             offset++;
             /* terminators are void */
             inst.type = 0;
             inst.dest = 0;
         } else {
+            printf("[parseBB] reading inst.type\n");
             inst.type = readNumber(buffer, &offset, len, &ok);
+            printf("[parseBB] reading inst.dest\n");
             inst.dest = readNumber(buffer, &offset, len, &ok);
         }
+        printf("[parseBB] reading opcode\n");
         inst.opcode = readFixedNumber(buffer, &offset, len, &ok, 2);
         if (!ok) {
             cli_errmsg("Invalid type or operand\n");
@@ -1236,6 +1313,7 @@ static int parseBB(struct cli_bc *bc, unsigned func, unsigned bb, unsigned char 
             return CL_EMALFDB;
         }
 
+        printf("[parseBB] switching on opcode 0x%x\n", inst.opcode);
         switch (inst.opcode) {
             case OP_BC_JMP:
                 inst.u.jump = readBBID(bcfunc, buffer, &offset, len, &ok);
@@ -1328,6 +1406,7 @@ static int parseBB(struct cli_bc *bc, unsigned func, unsigned bb, unsigned char 
                 /* fall-through */
             default:
                 numOp = operand_counts[inst.opcode];
+                printf("[parseBB] %d operands\n", numOp);
                 switch (numOp) {
                     case 0:
                         break;
@@ -1380,10 +1459,20 @@ static int parseBB(struct cli_bc *bc, unsigned func, unsigned bb, unsigned char 
             }
         }
         BB->insts[BB->numInsts++] = inst;
+        /** tracing **/
+        char *parsed_buf = calloc((offset - prev_off) + 1, sizeof(char));
+        strncpy(parsed_buf, buffer+prev_off, (offset - prev_off));
+        printf("[parsing %02x:%02x] offset: %d-%d, '%s' -> ", bb, BB->numInsts-1, prev_off, offset, parsed_buf);
+        free(parsed_buf);
+        unsigned int _bbnum = bb;
+        cli_byteinst_describe(&inst, &_bbnum);
+        puts("");
+
     }
+    printf("[parseBB] bb = %d; bc->funcs[%d].numBB = %d\n", bb, func, bc->funcs[func].numBB);
     if (bb + 1 == bc->funcs[func].numBB) {
         if (buffer[offset] != 'E') {
-            cli_errmsg("Missing basicblock terminator, got: %c\n", buffer[offset]);
+            printf("Missing basicblock terminator, got: %c\n", buffer[offset]);
             return CL_EMALFDB;
         }
         offset++;
@@ -1755,6 +1844,7 @@ static int register_events(cli_events_t *ev)
 
 int cli_bytecode_run(const struct cli_all_bc *bcs, const struct cli_bc *bc, struct cli_bc_ctx *ctx)
 {
+  puts("");
     int ret = CL_SUCCESS;
     struct cli_bc_inst inst;
     struct cli_bc_func func;
@@ -2174,7 +2264,11 @@ static int cli_bytecode_prepare_interpreter(struct cli_bc *bc)
         }
         for (j = 0; j < bcfunc->numInsts && ret == CL_SUCCESS; j++) {
             struct cli_bc_inst *inst = &bcfunc->allinsts[j];
+            /* there should be a bounds check on inst->dest here. */
+            /* too much trust in the compiler. */
+            printf("[cli_prepare_interpreter] mapping inst->dest from 0x%lx ", inst->dest);
             inst->dest               = map[inst->dest];
+            printf("--> 0x%lx\n", inst->dest);
             switch (inst->opcode) {
                 case OP_BC_ADD:
                 case OP_BC_SUB:
@@ -3250,74 +3344,75 @@ void cli_byteinst_describe(const struct cli_bc_inst *inst, unsigned *bbnum)
         return;
     }
 
-    snprintf(inst_str, sizeof(inst_str), "%-20s[%-3d/%3d/%3d]", bc_opstr[inst->opcode],
-             inst->opcode, inst->interp_op, inst->interp_op % inst->opcode);
+    snprintf(inst_str, sizeof(inst_str), "%-20s [%0x]", bc_opstr[inst->opcode],
+             inst->opcode);
+    /* why do we want to know the interp_op modulo the opcode enum? */
     printf("%-35s", inst_str);
     switch (inst->opcode) {
             // binary operations
         case OP_BC_ADD:
-            printf("%d = %d + %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x + 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_SUB:
-            printf("%d = %d - %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x - 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_MUL:
-            printf("%d = %d * %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x * 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_UDIV:
-            printf("%d = %d / %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x / 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_SDIV:
-            printf("%d = %d / %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x / 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_UREM:
-            printf("%d = %d %% %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x %% 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_SREM:
-            printf("%d = %d %% %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x %% 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_SHL:
-            printf("%d = %d << %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x << 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_LSHR:
-            printf("%d = %d >> %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x >> 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ASHR:
-            printf("%d = %d >> %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x >> 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_AND:
-            printf("%d = %d & %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x & 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_OR:
-            printf("%d = %d | %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x | 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_XOR:
-            printf("%d = %d ^ %d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = 0x%x ^ 0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
 
             // casting operations
         case OP_BC_TRUNC:
-            printf("%d = %d trunc " STDx64, inst->dest, inst->u.cast.source, inst->u.cast.mask);
+            printf("0x%x = 0x%x trunc " STDx64, inst->dest, inst->u.cast.source, inst->u.cast.mask);
             break;
         case OP_BC_SEXT:
-            printf("%d = %d sext " STDx64, inst->dest, inst->u.cast.source, inst->u.cast.mask);
+            printf("0x%x = 0x%x sext " STDx64, inst->dest, inst->u.cast.source, inst->u.cast.mask);
             break;
         case OP_BC_ZEXT:
-            printf("%d = %d zext " STDx64, inst->dest, inst->u.cast.source, inst->u.cast.mask);
+            printf("0x%x = 0x%x zext " STDx64, inst->dest, inst->u.cast.source, inst->u.cast.mask);
             break;
 
             // control operations (termination instructions)
         case OP_BC_BRANCH:
-            printf("br %d ? bb.%d : bb.%d", inst->u.branch.condition,
+            printf("br 0x%x ? bb.0x%x : bb.0x%x", inst->u.branch.condition,
                    inst->u.branch.br_true, inst->u.branch.br_false);
             (*bbnum)++;
             break;
         case OP_BC_JMP:
-            printf("jmp bb.%d", inst->u.jump);
+            printf("jmp bb.0x%x", inst->u.jump);
             (*bbnum)++;
             break;
         case OP_BC_RET:
-            printf("ret %d", inst->u.unaryop);
+            printf("ret 0x%x", inst->u.unaryop);
             (*bbnum)++;
             break;
         case OP_BC_RET_VOID:
@@ -3327,100 +3422,100 @@ void cli_byteinst_describe(const struct cli_bc_inst *inst, unsigned *bbnum)
 
             // comparison operations
         case OP_BC_ICMP_EQ:
-            printf("%d = (%d == %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x == 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_NE:
-            printf("%d = (%d != %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x != 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_UGT:
-            printf("%d = (%d > %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x > 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_UGE:
-            printf("%d = (%d >= %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x >= 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_ULT:
-            printf("%d = (%d > %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x > 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_ULE:
-            printf("%d = (%d >= %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x >= 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_SGT:
-            printf("%d = (%d > %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x > 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_SGE:
-            printf("%d = (%d >= %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x >= 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_SLE:
-            printf("%d = (%d <= %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x <= 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_ICMP_SLT:
-            printf("%d = (%d < %d)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = (0x%x < 0x%x)", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_SELECT:
-            printf("%d = %d ? %d : %d)", inst->dest, inst->u.three[0],
+            printf("0x%x = 0x%x ? 0x%x : 0x%x)", inst->dest, inst->u.three[0],
                    inst->u.three[1], inst->u.three[2]);
             break;
 
             // function calling
         case OP_BC_CALL_DIRECT:
-            printf("%d = call F.%d (", inst->dest, inst->u.ops.funcid);
+            printf("0x%x = call F.0x%x (", inst->dest, inst->u.ops.funcid);
             for (j = 0; j < inst->u.ops.numOps; ++j) {
                 if (j == inst->u.ops.numOps - 1) {
-                    printf("%d", inst->u.ops.ops[j]);
+                    printf("0x%x", inst->u.ops.ops[j]);
                 } else {
-                    printf("%d, ", inst->u.ops.ops[j]);
+                    printf("0x%x, ", inst->u.ops.ops[j]);
                 }
             }
             printf(")");
             break;
         case OP_BC_CALL_API: {
             if (inst->u.ops.funcid > cli_numapicalls) {
-                printf("apicall FID %d not yet implemented!\n", inst->u.ops.funcid);
+                printf("apicall FID 0x%x not yet implemented!\n", inst->u.ops.funcid);
                 break;
             }
             api = &cli_apicalls[inst->u.ops.funcid];
             switch (api->kind) {
                 case 0:
-                    printf("%d = %s[%d] (%d, %d)", inst->dest, api->name,
+                    printf("0x%x = %s[0x%x] (0x%x, 0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0], inst->u.ops.ops[1]);
                     break;
                 case 1:
-                    printf("%d = %s[%d] (p.%d, %d)", inst->dest, api->name,
+                    printf("0x%x = %s[0x%x] (p.0x%x, 0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0], inst->u.ops.ops[1]);
                     break;
                 case 2:
-                    printf("%d = %s[%d] (%d)", inst->dest, api->name,
+                    printf("0x%x = %s[0x%x] (0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0]);
                     break;
                 case 3:
-                    printf("p.%d = %s[%d] (%d)", inst->dest, api->name,
+                    printf("p.0x%x = %s[0x%x] (0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0]);
                     break;
                 case 4:
-                    printf("%d = %s[%d] (p.%d, %d, %d, %d, %d)", inst->dest, api->name,
+                    printf("0x%x = %s[0x%x] (p.0x%x, 0x%x, 0x%x, 0x%x, 0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0], inst->u.ops.ops[1],
                            inst->u.ops.ops[2], inst->u.ops.ops[3], inst->u.ops.ops[4]);
                     break;
                 case 5:
-                    printf("%d = %s[%d] ()", inst->dest, api->name,
+                    printf("0x%x = %s[0x%x] ()", inst->dest, api->name,
                            inst->u.ops.funcid);
                     break;
                 case 6:
-                    printf("p.%d = %s[%d] (%d, %d)", inst->dest, api->name,
+                    printf("p.0x%x = %s[0x%x] (0x%x, 0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0], inst->u.ops.ops[1]);
                     break;
                 case 7:
-                    printf("%d = %s[%d] (%d, %d, %d)", inst->dest, api->name,
+                    printf("0x%x = %s[0x%x] (0x%x, 0x%x, 0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0], inst->u.ops.ops[1],
                            inst->u.ops.ops[2]);
                     break;
                 case 8:
-                    printf("%d = %s[%d] (p.%d, %d, p.%d, %d)", inst->dest, api->name,
+                    printf("0x%x = %s[0x%x] (p.0x%x, 0x%x, p.0x%x, 0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0], inst->u.ops.ops[1],
                            inst->u.ops.ops[2], inst->u.ops.ops[3]);
                     break;
                 case 9:
-                    printf("%d = %s[%d] (p.%d, %d, %d)", inst->dest, api->name,
+                    printf("0x%x = %s[0x%x] (p.0x%x, 0x%x, 0x%x)", inst->dest, api->name,
                            inst->u.ops.funcid, inst->u.ops.ops[0], inst->u.ops.ops[1],
                            inst->u.ops.ops[2]);
                     break;
@@ -3432,65 +3527,65 @@ void cli_byteinst_describe(const struct cli_bc_inst *inst, unsigned *bbnum)
 
             // memory operations
         case OP_BC_COPY:
-            printf("cp %d -> %d", inst->u.binop[0], inst->u.binop[1]);
+            printf("cp 0x%x -> 0x%x", inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_GEP1:
-            printf("%d = gep1 p.%d + (%d * %d)", inst->dest, inst->u.three[1],
+            printf("0x%x = gep1 p.0x%x + (0x%x * 0x%x)", inst->dest, inst->u.three[1],
                    inst->u.three[2], inst->u.three[0]);
             break;
         case OP_BC_GEPZ:
-            printf("%d = gepz p.%d + (%d)", inst->dest,
+            printf("0x%x = gepz p.0x%x + (0x%x)", inst->dest,
                    inst->u.three[1], inst->u.three[2]);
             break;
         case OP_BC_GEPN:
             printf("illegal opcode, impossible");
             break;
         case OP_BC_STORE:
-            printf("store %d -> p.%d", inst->u.binop[0], inst->u.binop[1]);
+            printf("store 0x%x -> p.0x%x", inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_LOAD:
-            printf("load  %d <- p.%d", inst->dest, inst->u.unaryop);
+            printf("load  0x%x <- p.0x%x", inst->dest, inst->u.unaryop);
             break;
 
             // llvm intrinsics
         case OP_BC_MEMSET:
-            printf("%d = memset (p.%d, %d, %d)", inst->dest, inst->u.three[0],
+            printf("0x%x = memset (p.0x%x, 0x%x, 0x%x)", inst->dest, inst->u.three[0],
                    inst->u.three[1], inst->u.three[2]);
             break;
         case OP_BC_MEMCPY:
-            printf("%d = memcpy (p.%d, p.%d, %d)", inst->dest, inst->u.three[0],
+            printf("0x%x = memcpy (p.0x%x, p.0x%x, 0x%x)", inst->dest, inst->u.three[0],
                    inst->u.three[1], inst->u.three[2]);
             break;
         case OP_BC_MEMMOVE:
-            printf("%d = memmove (p.%d, p.%d, %d)", inst->dest, inst->u.three[0],
+            printf("0x%x = memmove (p.0x%x, p.0x%x, 0x%x)", inst->dest, inst->u.three[0],
                    inst->u.three[1], inst->u.three[2]);
             break;
         case OP_BC_MEMCMP:
-            printf("%d = memcmp (p.%d, p.%d, %d)", inst->dest, inst->u.three[0],
+            printf("0x%x = memcmp (p.0x%x, p.0x%x, 0x%x)", inst->dest, inst->u.three[0],
                    inst->u.three[1], inst->u.three[2]);
             break;
 
             // utility operations
         case OP_BC_ISBIGENDIAN:
-            printf("%d = isbigendian()", inst->dest);
+            printf("0x%x = isbigendian()", inst->dest);
             break;
         case OP_BC_ABORT:
             printf("ABORT!!");
             break;
         case OP_BC_BSWAP16:
-            printf("%d = bswap16 %d", inst->dest, inst->u.unaryop);
+            printf("0x%x = bswap16 0x%x", inst->dest, inst->u.unaryop);
             break;
         case OP_BC_BSWAP32:
-            printf("%d = bswap32 %d", inst->dest, inst->u.unaryop);
+            printf("0x%x = bswap32 0x%x", inst->dest, inst->u.unaryop);
             break;
         case OP_BC_BSWAP64:
-            printf("%d = bswap64 %d", inst->dest, inst->u.unaryop);
+            printf("0x%x = bswap64 0x%x", inst->dest, inst->u.unaryop);
             break;
         case OP_BC_PTRDIFF32:
-            printf("%d = ptrdiff32 p.%d p.%d", inst->dest, inst->u.binop[0], inst->u.binop[1]);
+            printf("0x%x = ptrdiff32 p.0x%x p.0x%x", inst->dest, inst->u.binop[0], inst->u.binop[1]);
             break;
         case OP_BC_PTRTOINT64:
-            printf("%d = ptrtoint64 p.%d", inst->dest, inst->u.unaryop);
+            printf("0x%x = ptrtoint64 p.0x%x", inst->dest, inst->u.unaryop);
             break;
         case OP_BC_INVALID: /* last */
             printf("INVALID!!");

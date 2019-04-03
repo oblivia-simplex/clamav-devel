@@ -74,6 +74,10 @@ struct cli_bc_inst {
     } u;
 };
 
+char * str_of_inst(struct cli_bc_inst *inst);
+
+char * printable_str(char *buf, int len);
+
 struct cli_bc_bb {
     unsigned numInsts;
     struct cli_bc_inst *insts;
