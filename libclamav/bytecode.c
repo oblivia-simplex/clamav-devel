@@ -1474,6 +1474,8 @@ static int parseBB(struct cli_bc *bc, unsigned func, unsigned bb, unsigned char 
         if (buffer[offset] != 'E') {
             printf("Missing basicblock terminator, got: %c\n", buffer[offset]);
             return CL_EMALFDB;
+        } else {
+          printf("[parseBB] found basicblock terminator 'E'\n");
         }
         offset++;
     }
@@ -1507,6 +1509,7 @@ static int parseBB(struct cli_bc *bc, unsigned func, unsigned bb, unsigned char 
     }
     bcfunc->numBytes = 0;
     bcfunc->insn_idx += BB->numInsts;
+    printf("[parseBB] bcfunc->insn_idx = %d; returning CL_SUCCESS.\n", bcfunc->insn_idx);
     return CL_SUCCESS;
 }
 
@@ -1755,6 +1758,7 @@ DEAD CODE
                 /* fall-through */
             case PARSE_FUNC_HEADER:
                 if (*buffer == 'S') {
+                  printf("[cli_bytecode_load] 'S' token. setting end = 1\n");
                     end = 1;
                     break;
                 }
@@ -1784,6 +1788,7 @@ DEAD CODE
                     cli_dbgmsg("Parsed %u BBs, %u instructions\n",
                                bb, bc->funcs[current_func].numInsts);
                     state = PARSE_FUNC_HEADER;
+                    printf("[cli_bytecode_load] state = PARSE_FUNC_HEADER\n");
                     current_func++;
                 }
                 break;
@@ -1797,8 +1802,8 @@ DEAD CODE
                 break;
         }
     }
+    printf("Parsed %d functions\n", current_func);
     free(buffer);
-    cli_dbgmsg("Parsed %d functions\n", current_func);
     if (sigperf)
         sigperf_events_init(bc);
     if (current_func != bc->num_func && bc->state != bc_skip) {
@@ -2239,6 +2244,7 @@ static int cli_bytecode_prepare_interpreter(struct cli_bc *bc)
         struct cli_bc_func *bcfunc = &bc->funcs[i];
         unsigned totValues         = bcfunc->numValues + bcfunc->numConstants + bc->num_globals;
         unsigned *map              = cli_malloc(sizeof(*map) * (size_t)totValues);
+        int mapsize = sizeof(*map) * (size_t)totValues;
         if (!map) {
             cli_errmsg("interpreter: Unable to allocate memory for map: %zu\n", sizeof(*map) * (size_t)totValues);
             free(gmap);
@@ -2266,9 +2272,15 @@ static int cli_bytecode_prepare_interpreter(struct cli_bc *bc)
             struct cli_bc_inst *inst = &bcfunc->allinsts[j];
             /* there should be a bounds check on inst->dest here. */
             /* too much trust in the compiler. */
+            if (inst->dest >= mapsize) {
+              printf("!!! inst->dest (0x%x) >= mapsize (0x%x)\n", inst->dest, mapsize);
+            }
             printf("[cli_prepare_interpreter] mapping inst->dest from 0x%lx ", inst->dest);
             inst->dest               = map[inst->dest];
             printf("--> 0x%lx\n", inst->dest);
+            int __dummy = 0;
+            cli_byteinst_describe(inst, &__dummy);
+            puts("");
             switch (inst->opcode) {
                 case OP_BC_ADD:
                 case OP_BC_SUB:
